@@ -1,0 +1,2 @@
+# bili-collection-pipeline
+B站合集批量转录工具：拉取列表→下载→Whisper转录→语义分段→Markdown输出
