@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
-Fetch Bilibili collection (播单/合集) video list via API.
+Fetch video list from a Bilibili collection or YouTube playlist.
 
 Usage:
-    python3 fetch_collection.py <bilibili-video-url> -o collection.json
+    # Bilibili
+    python3 fetch_collection.py "https://www.bilibili.com/video/BVxxxxxx" -o collection.json
     python3 fetch_collection.py BV1GeDSYhEVZ -o collection.json
+
+    # YouTube
+    python3 fetch_collection.py "https://youtube.com/playlist?list=PLxxxxx" -o collection.json
+    python3 fetch_collection.py "https://youtu.be/xxxxx" -o collection.json
 """
-import sys, os, json, argparse, urllib.request, re, time
+import sys, os, json, argparse, subprocess, urllib.request, re, time
+
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 except:
@@ -14,8 +20,42 @@ except:
 
 BAPI = 'https://api.bilibili.com'
 
-def api_get(url, retries=3):
-    """B站API GET请求"""
+
+# ── Helpers ──
+
+def run_cmd(args, timeout=30):
+    result = subprocess.run(args, capture_output=True, timeout=timeout)
+    try:
+        return (result.returncode,
+                result.stdout.decode('utf-8', errors='replace'),
+                result.stderr.decode('utf-8', errors='replace'))
+    except:
+        return (result.returncode, '', '')
+
+
+def extract_bvid(url_or_bvid):
+    s = url_or_bvid.strip()
+    if s.startswith('http'):
+        m = re.search(r'(BV[a-zA-Z0-9]+)', s)
+        return m.group(1) if m else None
+    return s if s.startswith('BV') else None
+
+
+def is_youtube_url(url):
+    url = url.strip()
+    patterns = [
+        r'youtube\.com/playlist',
+        r'youtube\.com/watch',
+        r'youtu\.be/',
+        r'youtube\.com/@',
+        r'youtube\.com/channel/',
+    ]
+    return any(re.search(p, url) for p in patterns)
+
+
+# ── Bilibili ──
+
+def bili_api_get(url, retries=3):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0',
         'Referer': 'https://www.bilibili.com/',
@@ -31,38 +71,19 @@ def api_get(url, retries=3):
             else:
                 raise
 
-def extract_bvid(url_or_bvid):
-    """从URL或纯BVID提取BVID"""
-    bvid = url_or_bvid.strip()
-    if bvid.startswith('http'):
-        m = re.search(r'(BV[a-zA-Z0-9]+)', bvid)
-        if m:
-            bvid = m.group(1)
-    return bvid if bvid.startswith('BV') else None
 
-def fetch_collection_info(bvid):
-    """通过B站API获取合集信息"""
-    # 第一步：获取视频信息，包括 season_id
-    view = api_get(f'{BAPI}/x/web-interface/view?bvid={bvid}')
+def fetch_bilibili(bvid):
+    """Fetch Bilibili collection by a video BVID"""
+    view = bili_api_get(f'{BAPI}/x/web-interface/view?bvid={bvid}')
     data = view.get('data', {})
-
-    # 尝试获取合集信息
     ugc_season = data.get('ugc_season', {})
-    season_id = None
-
-    if ugc_season:
-        season_id = ugc_season.get('id')
-        season_name = ugc_season.get('title', '')
-    else:
-        # 尝试从视图数据获取 season_id
-        season_id = data.get('season_id')
+    season_id = ugc_season.get('id') or data.get('season_id')
 
     if not season_id:
-        print(f'错误: 该视频不属于任何合集')
+        print('Error: video is not part of any collection')
         sys.exit(1)
 
-    # 第二步：获取合集全部视频
-    season_info = api_get(f'{BAPI}/x/web-interface/season?season_id={season_id}')
+    season_info = bili_api_get(f'{BAPI}/x/web-interface/season?season_id={season_id}')
     season_data = season_info.get('data', {})
 
     episodes = []
@@ -72,14 +93,14 @@ def fetch_collection_info(bvid):
             'title': ep.get('title', ''),
             'duration': ep.get('duration', 0),
             'url': f'https://www.bilibili.com/video/{ep["bvid"]}',
-            'page': ep.get('page', 1),
+            'platform': 'bilibili',
         })
 
+    # Fallback: paginated archives
     if not episodes:
-        # 尝试 season_archive_list (分页合集)
         page = 1
         while True:
-            arch = api_get(f'{BAPI}/x/web-interface/season/archive?season_id={season_id}&page={page}')
+            arch = bili_api_get(f'{BAPI}/x/web-interface/season/archive?season_id={season_id}&page={page}')
             arch_data = arch.get('data', {})
             arch_list = arch_data.get('archives', [])
             if not arch_list:
@@ -90,7 +111,7 @@ def fetch_collection_info(bvid):
                     'title': a.get('title', ''),
                     'duration': a.get('duration', 0),
                     'url': f'https://www.bilibili.com/video/{a["bvid"]}',
-                    'page': page,
+                    'platform': 'bilibili',
                 })
             if page >= arch_data.get('page', {}).get('count', 1):
                 break
@@ -100,51 +121,122 @@ def fetch_collection_info(bvid):
     up_name = season_data.get('up_name', data.get('owner', {}).get('name', ''))
     up_mid = season_data.get('up_mid', data.get('owner', {}).get('mid', ''))
 
-    result = {
+    return {
         'collection': {
-            'id': season_id,
-            'name': season_name or season_data.get('name', ''),
+            'id': str(season_id),
+            'name': ugc_season.get('title') or season_data.get('name', ''),
             'up_name': up_name,
             'up_mid': up_mid,
+            'platform': 'bilibili',
         },
         'videos': episodes,
         'total': len(episodes),
         'total_seconds': sum(e['duration'] for e in episodes),
     }
 
-    return result
 
-def main():
-    parser = argparse.ArgumentParser(description='Fetch Bilibili collection video list')
-    parser.add_argument('input', help='B站视频URL或BVID')
-    parser.add_argument('-o', '--output', default='collection.json', help='输出JSON文件')
-    args = parser.parse_args()
+# ── YouTube ──
 
-    bvid = extract_bvid(args.input)
-    if not bvid:
-        print('错误: 无法解析BVID')
+def fetch_youtube(url):
+    """Fetch YouTube playlist or channel videos using yt-dlp"""
+    rc, stdout, stderr = run_cmd([
+        'yt-dlp', '--flat-playlist', '--dump-json',
+        '--no-warnings', url
+    ], timeout=60)
+
+    if rc != 0:
+        print(f'yt-dlp error: {stderr[:300]}')
+        print('Make sure yt-dlp is installed: pip install yt-dlp')
         sys.exit(1)
 
-    print(f'正在获取视频 {bvid} 的合集信息...')
-    info = fetch_collection_info(bvid)
+    episodes = []
+    playlist_title = ''
+    uploader = ''
+
+    for line in stdout.strip().split('\n'):
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except:
+            continue
+
+        # First item has playlist metadata
+        if not playlist_title:
+            playlist_title = item.get('playlist_title', item.get('playlist', ''))
+            uploader = item.get('uploader', item.get('channel', ''))
+
+        vid = item.get('id', '')
+        title = item.get('title', '')
+        duration = item.get('duration', 0) or 0
+        webpage_url = item.get('webpage_url', item.get('url', f'https://youtube.com/watch?v={vid}'))
+
+        episodes.append({
+            'bvid': vid,  # Reuse bvid field for compatibility
+            'title': title,
+            'duration': duration,
+            'url': webpage_url,
+            'platform': 'youtube',
+        })
+
+    return {
+        'collection': {
+            'id': playlist_title or url,
+            'name': playlist_title or 'YouTube Playlist',
+            'up_name': uploader or '',
+            'up_mid': '',
+            'platform': 'youtube',
+        },
+        'videos': episodes,
+        'total': len(episodes),
+        'total_seconds': sum(e['duration'] for e in episodes),
+    }
+
+
+# ── Main ──
+
+def main():
+    parser = argparse.ArgumentParser(description='Fetch video list from Bilibili collection or YouTube playlist')
+    parser.add_argument('input', help='B站视频/合集URL / BVID / YouTube播放列表/视频URL')
+    parser.add_argument('-o', '--output', default='collection.json', help='Output JSON file')
+    args = parser.parse_args()
+
+    url = args.input.strip()
+
+    if is_youtube_url(url):
+        print('Detected YouTube URL. Fetching playlist with yt-dlp...')
+        info = fetch_youtube(url)
+    else:
+        bvid = extract_bvid(url)
+        if not bvid:
+            print('Error: could not parse BVID from input')
+            sys.exit(1)
+        print(f'Detected Bilibili URL. Fetching collection for {bvid}...')
+        info = fetch_bilibili(bvid)
 
     c = info['collection']
-    total_h = info['total_seconds'] // 3600
-    total_m = (info['total_seconds'] % 3600) // 60
-    print(f'\n合集: {c["name"]}')
-    print(f'UP主: {c["up_name"]} (mid={c["up_mid"]})')
-    print(f'集数: {info["total"]} 集')
-    print(f'总时长: {total_h}h{total_m}m')
-    print(f'\n按BVID排序的视频列表:')
+    total_s = info['total_seconds']
+    total_h = total_s // 3600
+    total_m = (total_s % 3600) // 60
+
+    print(f'\nCollection: {c["name"]}')
+    print(f'Platform:   {c["platform"]}')
+    if c.get('up_name'):
+        print(f'Creator:    {c["up_name"]}')
+    print(f'Videos:     {info["total"]}')
+    print(f'Duration:   {total_h}h{total_m}m')
+    print()
 
     for i, v in enumerate(info['videos'], 1):
         m = v['duration'] // 60
         s = v['duration'] % 60
-        print(f'  [{i:3d}] {v["bvid"]}  {v["title"][:50]:50s}  {m}:{s:02d}')
+        vid_label = v['bvid'] or v['url'][:20]
+        print(f'  [{i:3d}] {vid_label:20s}  {v["title"][:50]:50s}  {m}:{s:02d}')
 
     with open(args.output, 'w', encoding='utf-8') as f:
         json.dump(info, f, ensure_ascii=False, indent=2)
-    print(f'\n已保存: {args.output}')
+    print(f'\nSaved: {args.output}')
+
 
 if __name__ == '__main__':
     main()
